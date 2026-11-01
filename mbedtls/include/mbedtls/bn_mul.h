@@ -179,7 +179,7 @@
 #define MULADDC_STOP                        \
         : "+c" (c), "+D" (d), "+S" (s)      \
         : "b" (b)                           \
-        : "rax", "rdx", "r8"                \
+        : "rax", "rdx", "r8", "cc", "memory" \
     );
 
 #endif /* AMD64 */

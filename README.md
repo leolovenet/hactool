@@ -138,6 +138,14 @@ Use `--romfs=merged.romfs` instead of `--romfsdir` when a standalone merged RomF
 image is wanted. Ordinary NCA/RomFS handling and legacy Patch RomFS continue through
 their original code paths.
 
+## x86-64 Signature Verification
+
+The bundled mbedTLS 2.6.1 AMD64 big-number assembly writes directly through its
+source and destination pointers. This tree declares the required `memory` clobber
+(and the affected condition flags) so optimized builds cannot cache stale limbs.
+Without that declaration, RSA exponentiation can produce the wrong result and make
+valid NCA, NPDM or ACID signatures appear invalid under `--verify`.
+
 ## Licensing
 
 This software is licensed under the terms of the ISC License.  

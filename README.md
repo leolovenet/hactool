@@ -109,6 +109,17 @@ In addition, if -k/--keyset is not set, hactool will check for the presence of a
 in $HOME/.switch/prod.keys (or $HOME/.switch/dev.keys if -d/--dev is set). If present, this file
 will automatically be loaded.
 
+For title-key crypto, `title.keys` entries contain the rights ID and the ticket's
+encrypted 16-byte title-key block, not a pre-decrypted content key. An optional
+`<keygen>` suffix is accepted for shared use with sys-agent:
+
+```text
+<rights id> = <32 hex digit title-key block> [keygen]
+```
+
+hactool ignores the suffix when selecting titlekek; it still uses the NCA's
+master-key revision.
+
 ## Licensing
 
 This software is licensed under the terms of the ISC License.  

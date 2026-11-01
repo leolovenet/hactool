@@ -151,6 +151,41 @@ static char hextoi(char c) {
     return 0;
 }
 
+static int parse_titlekey_value(unsigned char *titlekey, const char *value) {
+    char titlekey_hex[0x21];
+    if (strlen(value) < 0x20) {
+        return 0;
+    }
+    for (unsigned int i = 0; i < 0x20; i++) {
+        if (!ishex(value[i])) {
+            return 0;
+        }
+    }
+    titlekey_hex[0x20] = '\0';
+    memcpy(titlekey_hex, value, 0x20);
+
+    const char *suffix = value + 0x20;
+    if (*suffix != '\0') {
+        if (*suffix != ' ' && *suffix != '\t') {
+            return 0;
+        }
+        while (*suffix == ' ' || *suffix == '\t') {
+            suffix++;
+        }
+        if (*suffix == '\0') {
+            return 0;
+        }
+        for (; *suffix != '\0'; suffix++) {
+            if (!ishex(*suffix) && *suffix != 'x' && *suffix != 'X') {
+                return 0;
+            }
+        }
+    }
+
+    parse_hex_key(titlekey, titlekey_hex, 0x10);
+    return 1;
+}
+
 void parse_hex_key(unsigned char *key, const char *hex, unsigned int len) {
     if (strlen(hex) != 2 * len) {
         fprintf(stderr, "Key (%s) must be %"PRIu32" hex digits!\n", hex, 2 * len);
@@ -199,12 +234,15 @@ void extkeys_parse_titlekeys(hactool_settings_t *settings, FILE *f) {
             }
             if (should_ignore_key) {
                 if (!settings->skip_key_warnings) {
-                    fprintf(stderr, "[WARN]: Invalid title.keys content: \"%s\", (value \"%s\")\n", key, value);
+                    fprintf(stderr, "[WARN]: Ignoring invalid title.keys rights ID.\n");
                 }
             } else {
                 parse_hex_key(rights_id, key, sizeof(rights_id));
-                parse_hex_key(titlekey, value, sizeof(titlekey));
-                settings_add_titlekey(settings, rights_id, titlekey);
+                if (parse_titlekey_value(titlekey, value)) {
+                    settings_add_titlekey(settings, rights_id, titlekey);
+                } else if (!settings->skip_key_warnings) {
+                    fprintf(stderr, "[WARN]: Ignoring invalid title.keys value.\n");
+                }
             }
         }
     }

@@ -12,7 +12,7 @@
  * The input file is assumed to have been opened with the 'b' flag.
  * The input file is assumed to contain only ASCII.
  *
- * A line cannot exceed 512 bytes in length.
+ * A line cannot exceed 65535 bytes in length.
  * Lines that are excessively long will be silently truncated.
  *
  * On success, *key and *value will be set to point to the key and value in
@@ -48,7 +48,7 @@ static int get_kv(FILE *f, char **key, char **value) {
     for (; *p == ' ' || *p == '\t'; ++p)\
         ;\
 } while(0);
-    static char line[1024];
+    static char line[65536];
     char *k, *v, *p, *end;
 
     *key = *value = NULL;
@@ -67,7 +67,7 @@ static int get_kv(FILE *f, char **key, char **value) {
         return 0;
 
     /* Not finding \r or \n is not a problem.
-     * The line might just be exactly 512 characters long, we have no way to
+     * The line might just be exactly 65535 characters long, we have no way to
      * tell.
      * Additionally, it's possible that the last line of a file is not actually
      * a line (i.e., does not end in '\n'); we do want to handle those.

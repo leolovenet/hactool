@@ -1373,17 +1373,22 @@ void nca_save_section_file(nca_section_ctx_t *ctx, uint64_t ofs, uint64_t total_
         return;
     }
 
-    uint64_t read_size = 0x400000; /* 4 MB buffer. */
-    unsigned char *buf = malloc(read_size);
+    const uint64_t max_read_size = 0x400000; /* 4 MB buffer. */
+    unsigned char *buf = malloc(max_read_size);
     if (buf == NULL) {
         fprintf(stderr, "Failed to allocate file-save buffer!\n");
         exit(EXIT_FAILURE);
     }
-    memset(buf, 0xCC, read_size); /* Debug in case I fuck this up somehow... */
+    memset(buf, 0xCC, max_read_size); /* Debug in case I fuck this up somehow... */
+    if (total_size > UINT64_MAX - ofs) {
+        fprintf(stderr, "Section save range overflows at 0x%"PRIx64" + 0x%"PRIx64"!\n", ofs, total_size);
+        exit(EXIT_FAILURE);
+    }
     uint64_t end_ofs = ofs + total_size;
     while (ofs < end_ofs) {
         nca_section_fseek(ctx, ofs);
-        if (ofs + read_size >= end_ofs) read_size = end_ofs - ofs;
+        uint64_t read_size = max_read_size;
+        if (read_size >= end_ofs - ofs) read_size = end_ofs - ofs;
         if (nca_section_fread(ctx, buf, read_size) != read_size) {
             fprintf(stderr, "Failed to read file!\n");
             exit(EXIT_FAILURE);

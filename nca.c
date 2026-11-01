@@ -8,9 +8,194 @@
 #include "extkeys.h"
 #include "filepath.h"
 
+#define BKTR_MODERN_ENTRY_NODE_SIZE 0x4000
+#define BKTR_MODERN_HEADER_SIZE 0x10
+#define NCA_METADATA_HASH_HIERARCHICAL_INTEGRITY 1
+
+typedef struct {
+    uint32_t index;
+    uint32_t count;
+    uint64_t offset;
+} __attribute__((packed)) bktr_modern_node_header_t;
+
+typedef struct {
+    uint64_t virtual_offset;
+    uint64_t physical_offset;
+    uint32_t storage_index;
+} __attribute__((packed)) bktr_modern_indirect_entry_t;
+
+typedef struct {
+    uint64_t offset;
+    uint8_t encryption;
+    uint8_t reserved[3];
+    uint32_t generation;
+} __attribute__((packed)) bktr_modern_aes_ctr_ex_entry_t;
+
 /* Initialize the context. */
 void nca_init(nca_ctx_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
+}
+
+static int bktr_is_modern_table(const void *raw, size_t raw_size, size_t entry_size) {
+    if (raw == NULL || raw_size < BKTR_MODERN_ENTRY_NODE_SIZE || entry_size == 0) {
+        return 0;
+    }
+    const bktr_modern_node_header_t *offset_header = (const bktr_modern_node_header_t *)raw;
+    if (offset_header->index != 0 || offset_header->count == 0) {
+        return 0;
+    }
+    size_t expected_size = (size_t)(offset_header->count + 1) * BKTR_MODERN_ENTRY_NODE_SIZE;
+    if (raw_size < expected_size || raw_size - expected_size >= BKTR_MODERN_ENTRY_NODE_SIZE) {
+        return 0;
+    }
+    size_t max_entries = (BKTR_MODERN_ENTRY_NODE_SIZE - BKTR_MODERN_HEADER_SIZE) / entry_size;
+    for (uint32_t i = 0; i < offset_header->count; i++) {
+        size_t node_offset = (size_t)(i + 1) * BKTR_MODERN_ENTRY_NODE_SIZE;
+        const bktr_modern_node_header_t *header = (const bktr_modern_node_header_t *)((const uint8_t *)raw + node_offset);
+        if (header->index != i || header->count == 0 || header->count > max_entries) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static bktr_relocation_block_t *bktr_convert_indirect_table(
+    const void *raw, uint32_t node_count) {
+    size_t entry_count = 0;
+    for (uint32_t i = 0; i < node_count; i++) {
+        size_t node_offset = (size_t)(i + 1) * BKTR_MODERN_ENTRY_NODE_SIZE;
+        const bktr_modern_node_header_t *header = (const bktr_modern_node_header_t *)((const uint8_t *)raw + node_offset);
+        entry_count += header->count;
+    }
+
+    const size_t max_bucket_entries = 0x3FF0 / sizeof(bktr_relocation_entry_t);
+    const size_t bucket_count = (entry_count + max_bucket_entries - 1) / max_bucket_entries;
+    const size_t alloc_size = sizeof(bktr_relocation_block_t)
+        + bucket_count * (sizeof(bktr_relocation_bucket_t) + sizeof(bktr_relocation_entry_t));
+    bktr_relocation_block_t *out = calloc(1, alloc_size);
+    if (out == NULL) {
+        return NULL;
+    }
+    const bktr_modern_node_header_t *offset_header = (const bktr_modern_node_header_t *)raw;
+    out->total_size = offset_header->offset;
+    out->num_buckets = (uint32_t)bucket_count;
+
+    bktr_relocation_bucket_t *bucket = NULL;
+    uint32_t bucket_index = 0;
+    uint32_t used = 0;
+    uint64_t previous_virtual_offset = 0;
+    int have_previous_virtual_offset = 0;
+    for (uint32_t i = 0; i < node_count; i++) {
+        size_t node_offset = (size_t)(i + 1) * BKTR_MODERN_ENTRY_NODE_SIZE;
+        const bktr_modern_node_header_t *header = (const bktr_modern_node_header_t *)((const uint8_t *)raw + node_offset);
+        const bktr_modern_indirect_entry_t *entries = (const bktr_modern_indirect_entry_t *)((const uint8_t *)raw
+            + node_offset + BKTR_MODERN_HEADER_SIZE);
+        for (uint32_t j = 0; j < header->count; j++) {
+            if (entries[j].storage_index > 1 ||
+                (have_previous_virtual_offset && entries[j].virtual_offset <= previous_virtual_offset)) {
+                free(out);
+                return NULL;
+            }
+            previous_virtual_offset = entries[j].virtual_offset;
+            have_previous_virtual_offset = 1;
+            if (bucket == NULL || used == max_bucket_entries) {
+                if (bucket != NULL) {
+                    bucket->entries[used].virt_offset = entries[j].virtual_offset;
+                    bucket->entries[used].phys_offset = entries[j].physical_offset;
+                    bucket->entries[used].is_patch = entries[j].storage_index;
+                    bucket->num_entries = used;
+                }
+                bucket = bktr_get_relocation_bucket(out, bucket_index);
+                out->bucket_virtual_offsets[bucket_index] = entries[j].virtual_offset;
+                bucket->num_entries = 0;
+                used = 0;
+                bucket_index++;
+            }
+            bucket->entries[used].virt_offset = entries[j].virtual_offset;
+            bucket->entries[used].phys_offset = entries[j].physical_offset;
+            bucket->entries[used].is_patch = entries[j].storage_index;
+            used++;
+        }
+    }
+    if (bucket != NULL) {
+        bucket->entries[used].virt_offset = out->total_size;
+        bucket->entries[used].phys_offset = 0;
+        bucket->entries[used].is_patch = 0;
+        bucket->num_entries = used;
+    }
+    return out;
+}
+
+static bktr_subsection_block_t *bktr_convert_aes_ctr_ex_table(
+    const void *raw, uint32_t node_count) {
+    size_t entry_count = 0;
+    for (uint32_t i = 0; i < node_count; i++) {
+        size_t node_offset = (size_t)(i + 1) * BKTR_MODERN_ENTRY_NODE_SIZE;
+        const bktr_modern_node_header_t *header = (const bktr_modern_node_header_t *)((const uint8_t *)raw + node_offset);
+        entry_count += header->count;
+    }
+
+    /*
+     * Keep one entry slot for the terminating offset. A subsection bucket is
+     * exactly 0x4000 bytes, so using all 1023 table slots would put that
+     * sentinel into the next bucket's header.
+     */
+    const size_t max_bucket_entries = 0x3FE;
+    const size_t bucket_count = (entry_count + max_bucket_entries - 1) / max_bucket_entries;
+    const size_t alloc_size = sizeof(bktr_subsection_block_t)
+        + bucket_count * (sizeof(bktr_subsection_bucket_t) + sizeof(bktr_subsection_entry_t));
+    bktr_subsection_block_t *out = calloc(1, alloc_size);
+    if (out == NULL) {
+        return NULL;
+    }
+    const bktr_modern_node_header_t *offset_header = (const bktr_modern_node_header_t *)raw;
+    out->total_size = offset_header->offset;
+    out->num_buckets = (uint32_t)bucket_count;
+
+    bktr_subsection_bucket_t *bucket = NULL;
+    uint32_t bucket_index = 0;
+    uint32_t used = 0;
+    uint64_t previous_offset = 0;
+    int have_previous_offset = 0;
+    for (uint32_t i = 0; i < node_count; i++) {
+        size_t node_offset = (size_t)(i + 1) * BKTR_MODERN_ENTRY_NODE_SIZE;
+        const bktr_modern_node_header_t *header = (const bktr_modern_node_header_t *)((const uint8_t *)raw + node_offset);
+        const bktr_modern_aes_ctr_ex_entry_t *entries = (const bktr_modern_aes_ctr_ex_entry_t *)((const uint8_t *)raw
+            + node_offset + BKTR_MODERN_HEADER_SIZE);
+        for (uint32_t j = 0; j < header->count; j++) {
+            if (entries[j].encryption > 1 ||
+                (have_previous_offset && entries[j].offset <= previous_offset)) {
+                free(out);
+                return NULL;
+            }
+            previous_offset = entries[j].offset;
+            have_previous_offset = 1;
+            if (bucket == NULL || used == max_bucket_entries) {
+                if (bucket != NULL) {
+                    bucket->entries[used].offset = entries[j].offset;
+                    bucket->entries[used]._0x8 = entries[j].encryption;
+                    bucket->entries[used].ctr_val = entries[j].generation;
+                    bucket->num_entries = used;
+                }
+                bucket = bktr_get_subsection_bucket(out, bucket_index);
+                out->bucket_physical_offsets[bucket_index] = entries[j].offset;
+                bucket->num_entries = 0;
+                used = 0;
+                bucket_index++;
+            }
+            bucket->entries[used].offset = entries[j].offset;
+            bucket->entries[used]._0x8 = entries[j].encryption;
+            bucket->entries[used].ctr_val = entries[j].generation;
+            used++;
+        }
+    }
+    if (bucket != NULL) {
+        bucket->entries[used].offset = out->total_size;
+        bucket->entries[used]._0x8 = 1;
+        bucket->entries[used].ctr_val = 0;
+        bucket->num_entries = used;
+    }
+    return out;
 }
 
 /* Updates the CTR for an offset. */
@@ -87,6 +272,12 @@ static size_t nca_bktr_section_physical_fread(nca_section_ctx_t *ctx, void *buff
     }
 
     bktr_subsection_entry_t *subsec = bktr_get_subsection(ctx->bktr_ctx.subsection_block, ctx->bktr_ctx.bktr_seek);
+    if (ctx->bktr_ctx.modern_layout && subsec->_0x8 != 0) {
+        fseeko64(ctx->file, ctx->offset + ctx->bktr_ctx.bktr_seek, SEEK_SET);
+        read = fread(buffer, size, count, ctx->file);
+        nca_section_fseek(ctx, ctx->bktr_ctx.virtual_seek + read);
+        return read;
+    }
     nca_update_bktr_ctr(ctx->ctr, subsec->ctr_val, ctx->bktr_ctx.bktr_seek + ctx->offset);
     fseeko64(ctx->file, (ctx->offset + ctx->bktr_ctx.bktr_seek) & ~0xF, SEEK_SET);
     uint32_t block_ofs;
@@ -107,6 +298,12 @@ static size_t nca_bktr_section_physical_fread(nca_section_ctx_t *ctx, void *buff
             memcpy(buffer, block_buf + block_ofs, 0x10 - block_ofs);
             uint32_t read_in_block = 0x10 - block_ofs;
             nca_section_fseek(ctx, ctx->bktr_ctx.virtual_seek - block_ofs + 0x10);
+            if (ctx->bktr_ctx.modern_layout) {
+                ctx->physical_reads++;
+                size_t tail = nca_section_fread(ctx, (char *)buffer + read_in_block, count - read_in_block);
+                ctx->physical_reads--;
+                return read_in_block + tail;
+            }
             return read_in_block + nca_section_fread(ctx, (char *)buffer + read_in_block, count - read_in_block);
         }
         if ((read = fread(buffer, 1, count, ctx->file)) != count) {
@@ -118,10 +315,23 @@ static size_t nca_bktr_section_physical_fread(nca_section_ctx_t *ctx, void *buff
     } else {
         /* Sad path. */
         uint64_t within_subsection = next_subsec->offset - ctx->bktr_ctx.bktr_seek;
-        if ((read = nca_section_fread(ctx, buffer, within_subsection)) != within_subsection) {
+        if (ctx->bktr_ctx.modern_layout) {
+            ctx->physical_reads++;
+            read = nca_section_fread(ctx, buffer, within_subsection);
+            ctx->physical_reads--;
+        } else {
+            read = nca_section_fread(ctx, buffer, within_subsection);
+        }
+        if (read != within_subsection) {
             return 0;
         }
-        read += nca_section_fread(ctx, (char *)buffer + within_subsection, count - within_subsection);
+        if (ctx->bktr_ctx.modern_layout) {
+            ctx->physical_reads++;
+            read += nca_section_fread(ctx, (char *)buffer + within_subsection, count - within_subsection);
+            ctx->physical_reads--;
+        } else {
+            read += nca_section_fread(ctx, (char *)buffer + within_subsection, count - within_subsection);
+        }
         if (read != count) {
             return 0;
         }
@@ -1148,11 +1358,6 @@ void nca_process_bktr_section(nca_section_ctx_t *ctx) {
     bktr_superblock_t *sb = ctx->bktr_ctx.superblock;
     /* Validate magics. */
     if (sb->relocation_header.magic == MAGIC_BKTR && sb->subsection_header.magic == MAGIC_BKTR) {
-        if (sb->relocation_header.offset + sb->relocation_header.size != sb->subsection_header.offset ||
-            sb->subsection_header.offset + sb->subsection_header.size != ctx->size) {
-            fprintf(stderr, "Invalid BKTR layout!\n");
-            exit(EXIT_FAILURE);
-        }
         /* Allocate space for an extra (fake) relocation entry, to simplify our logic. */
         void *relocs = calloc(1, sb->relocation_header.size + (0x3FF0 / sizeof(uint64_t)) * sizeof(bktr_relocation_entry_t));
         if (relocs == NULL) {
@@ -1176,43 +1381,90 @@ void nca_process_bktr_section(nca_section_ctx_t *ctx) {
             exit(EXIT_FAILURE);
         }
 
-        /* NOTE: Setting these variables changes the way fseek/fread work! */
-        ctx->bktr_ctx.relocation_block = relocs;
-        ctx->bktr_ctx.subsection_block = subs;
+        /*
+         * Legacy and modern BKTR tables use the same node framing. The FS
+         * header flag distinguishes layouts that hactool's original bucket
+         * parser can consume from the newer layered Patch RomFS layout.
+         */
+        int modern_relocation =
+            bktr_is_modern_table(relocs, sb->relocation_header.size, sizeof(bktr_modern_indirect_entry_t));
+        int modern_subsection =
+            bktr_is_modern_table(subs, sb->subsection_header.size, sizeof(bktr_modern_aes_ctr_ex_entry_t));
+        int modern_layout = ctx->header->metadata_hash_type == NCA_METADATA_HASH_HIERARCHICAL_INTEGRITY &&
+            modern_relocation && modern_subsection;
 
-        if (ctx->bktr_ctx.subsection_block->total_size != sb->subsection_header.offset) {
+        if (modern_layout) {
+            const bktr_modern_node_header_t *rel_header = (const bktr_modern_node_header_t *)relocs;
+            const bktr_modern_node_header_t *sub_header = (const bktr_modern_node_header_t *)subs;
+            if (sb->relocation_header.offset + sb->relocation_header.size != sb->subsection_header.offset ||
+                sb->subsection_header.offset + sb->subsection_header.size > ctx->size) {
+                free(relocs);
+                free(subs);
+                fprintf(stderr, "Invalid modern BKTR layout!\n");
+                exit(EXIT_FAILURE);
+            }
+            ctx->bktr_ctx.relocation_block = bktr_convert_indirect_table(relocs, rel_header->count);
+            ctx->bktr_ctx.subsection_block = bktr_convert_aes_ctr_ex_table(subs, sub_header->count);
+            ctx->bktr_ctx.modern_layout = 1;
             free(relocs);
             free(subs);
-            ctx->bktr_ctx.relocation_block = NULL;
-            ctx->bktr_ctx.subsection_block = NULL;
-            ctx->superblock_hash_validity = VALIDITY_INVALID;
-            return;
-        }
+            if (ctx->bktr_ctx.relocation_block == NULL || ctx->bktr_ctx.subsection_block == NULL) {
+                free(ctx->bktr_ctx.relocation_block);
+                free(ctx->bktr_ctx.subsection_block);
+                ctx->bktr_ctx.relocation_block = NULL;
+                ctx->bktr_ctx.subsection_block = NULL;
+                ctx->superblock_hash_validity = VALIDITY_INVALID;
+                return;
+            }
+        } else {
+            /* Preserve hactool's original legacy BKTR path unchanged. */
+            if (sb->relocation_header.offset + sb->relocation_header.size != sb->subsection_header.offset ||
+                sb->subsection_header.offset + sb->subsection_header.size != ctx->size) {
+                free(relocs);
+                free(subs);
+                fprintf(stderr, "Invalid BKTR layout!\n");
+                exit(EXIT_FAILURE);
+            }
 
-        /* This simplifies logic greatly... */
-        for (unsigned int i = ctx->bktr_ctx.relocation_block->num_buckets - 1; i > 0; i--) {
-            memcpy(bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i), &ctx->bktr_ctx.relocation_block->buckets[i], sizeof(bktr_relocation_bucket_t));
+            /* NOTE: Setting these variables changes the way fseek/fread work! */
+            ctx->bktr_ctx.relocation_block = relocs;
+            ctx->bktr_ctx.subsection_block = subs;
+            ctx->bktr_ctx.modern_layout = 0;
+
+            if (ctx->bktr_ctx.subsection_block->total_size != sb->subsection_header.offset) {
+                free(relocs);
+                free(subs);
+                ctx->bktr_ctx.relocation_block = NULL;
+                ctx->bktr_ctx.subsection_block = NULL;
+                ctx->superblock_hash_validity = VALIDITY_INVALID;
+                return;
+            }
+
+            /* This simplifies logic greatly... */
+            for (unsigned int i = ctx->bktr_ctx.relocation_block->num_buckets - 1; i > 0; i--) {
+                memcpy(bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i), &ctx->bktr_ctx.relocation_block->buckets[i], sizeof(bktr_relocation_bucket_t));
+            }
+            for (unsigned int i = 0; i + 1 < ctx->bktr_ctx.relocation_block->num_buckets; i++) {
+                bktr_relocation_bucket_t *cur_bucket = bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i);
+                cur_bucket->entries[cur_bucket->num_entries].virt_offset = ctx->bktr_ctx.relocation_block->bucket_virtual_offsets[i + 1];
+            }
+            for (unsigned int i = ctx->bktr_ctx.subsection_block->num_buckets - 1; i > 0; i--) {
+                memcpy(bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i), &ctx->bktr_ctx.subsection_block->buckets[i], sizeof(bktr_subsection_bucket_t));
+            }
+            for (unsigned int i = 0; i + 1 < ctx->bktr_ctx.subsection_block->num_buckets; i++) {
+                bktr_subsection_bucket_t *cur_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i);
+                bktr_subsection_bucket_t *next_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i+1);
+                cur_bucket->entries[cur_bucket->num_entries].offset = next_bucket->entries[0].offset;
+                cur_bucket->entries[cur_bucket->num_entries].ctr_val = next_bucket->entries[0].ctr_val;
+            }
+            bktr_relocation_bucket_t *last_reloc_bucket = bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, ctx->bktr_ctx.relocation_block->num_buckets - 1);
+            bktr_subsection_bucket_t *last_subsec_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, ctx->bktr_ctx.subsection_block->num_buckets - 1);
+            last_reloc_bucket->entries[last_reloc_bucket->num_entries].virt_offset = ctx->bktr_ctx.relocation_block->total_size;
+            last_subsec_bucket->entries[last_subsec_bucket->num_entries].offset = sb->relocation_header.offset;
+            last_subsec_bucket->entries[last_subsec_bucket->num_entries].ctr_val = ctx->header->section_ctr_low;
+            last_subsec_bucket->entries[last_subsec_bucket->num_entries + 1].offset = ctx->size;
+            last_subsec_bucket->entries[last_subsec_bucket->num_entries + 1].ctr_val = 0;
         }
-        for (unsigned int i = 0; i + 1 < ctx->bktr_ctx.relocation_block->num_buckets; i++) {
-            bktr_relocation_bucket_t *cur_bucket = bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i);
-            cur_bucket->entries[cur_bucket->num_entries].virt_offset = ctx->bktr_ctx.relocation_block->bucket_virtual_offsets[i + 1];
-        }
-        for (unsigned int i = ctx->bktr_ctx.subsection_block->num_buckets - 1; i > 0; i--) {
-            memcpy(bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i), &ctx->bktr_ctx.subsection_block->buckets[i], sizeof(bktr_subsection_bucket_t));
-        }
-        for (unsigned int i = 0; i + 1 < ctx->bktr_ctx.subsection_block->num_buckets; i++) {
-            bktr_subsection_bucket_t *cur_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i);
-            bktr_subsection_bucket_t *next_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i+1);
-            cur_bucket->entries[cur_bucket->num_entries].offset = next_bucket->entries[0].offset;
-            cur_bucket->entries[cur_bucket->num_entries].ctr_val = next_bucket->entries[0].ctr_val;
-        }
-        bktr_relocation_bucket_t *last_reloc_bucket = bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, ctx->bktr_ctx.relocation_block->num_buckets - 1);
-        bktr_subsection_bucket_t *last_subsec_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, ctx->bktr_ctx.subsection_block->num_buckets - 1);
-        last_reloc_bucket->entries[last_reloc_bucket->num_entries].virt_offset = ctx->bktr_ctx.relocation_block->total_size;
-        last_subsec_bucket->entries[last_subsec_bucket->num_entries].offset = sb->relocation_header.offset;
-        last_subsec_bucket->entries[last_subsec_bucket->num_entries].ctr_val = ctx->header->section_ctr_low;
-        last_subsec_bucket->entries[last_subsec_bucket->num_entries + 1].offset = ctx->size;
-        last_subsec_bucket->entries[last_subsec_bucket->num_entries + 1].ctr_val = 0;
 
         /* Now parse out the romfs stuff. */
         for (unsigned int i = 0; i < IVFC_MAX_LEVEL; i++) {
@@ -1389,6 +1641,33 @@ void nca_save_section_file(nca_section_ctx_t *ctx, uint64_t ofs, uint64_t total_
         nca_section_fseek(ctx, ofs);
         uint64_t read_size = max_read_size;
         if (read_size >= end_ofs - ofs) read_size = end_ofs - ofs;
+        if (ctx->type == BKTR && ctx->tool_ctx->base_file != NULL
+            && ctx->bktr_ctx.relocation_block != NULL) {
+            bktr_relocation_entry_t *reloc = bktr_get_relocation(
+                ctx->bktr_ctx.relocation_block, ofs);
+            bktr_relocation_entry_t *next_reloc = reloc + 1;
+            if (next_reloc->virt_offset <= ofs) {
+                fprintf(stderr, "BKTR relocation is not ordered at 0x%"PRIx64"!\n", ofs);
+                exit(EXIT_FAILURE);
+            }
+            uint64_t virtual_remaining = next_reloc->virt_offset - ofs;
+            if (read_size > virtual_remaining) read_size = virtual_remaining;
+            if (reloc->is_patch && ctx->bktr_ctx.subsection_block != NULL) {
+                bktr_subsection_entry_t *subsec = bktr_get_subsection(
+                    ctx->bktr_ctx.subsection_block, ctx->bktr_ctx.bktr_seek);
+                bktr_subsection_entry_t *next_subsec = subsec + 1;
+                if (next_subsec->offset <= ctx->bktr_ctx.bktr_seek) {
+                    fprintf(stderr, "BKTR AesCtrEx range is not ordered at 0x%"PRIx64"!\n", ctx->bktr_ctx.bktr_seek);
+                    exit(EXIT_FAILURE);
+                }
+                uint64_t physical_remaining = next_subsec->offset - ctx->bktr_ctx.bktr_seek;
+                if (read_size > physical_remaining) read_size = physical_remaining;
+            }
+        }
+        if (read_size == 0) {
+            fprintf(stderr, "BKTR produced a zero-sized virtual read at 0x%"PRIx64"!\n", ofs);
+            exit(EXIT_FAILURE);
+        }
         if (nca_section_fread(ctx, buf, read_size) != read_size) {
             fprintf(stderr, "Failed to read file!\n");
             exit(EXIT_FAILURE);
@@ -1442,7 +1721,7 @@ void nca_save_section(nca_section_ctx_t *ctx) {
     /* Handle overrides. */
     if (ctx->type == PFS0 && ctx->pfs0_ctx.is_exefs && ctx->tool_ctx->settings.exefs_path.enabled && ctx->tool_ctx->settings.exefs_path.path.valid == VALIDITY_VALID) {
         secpath = &ctx->tool_ctx->settings.exefs_path.path;
-    } else if ((ctx->type == ROMFS || ctx->type == NCA0_ROMFS) && ctx->tool_ctx->settings.romfs_path.enabled && ctx->tool_ctx->settings.romfs_path.path.valid == VALIDITY_VALID) {
+    } else if ((ctx->type == ROMFS || ctx->type == NCA0_ROMFS || ctx->type == BKTR) && ctx->tool_ctx->settings.romfs_path.enabled && ctx->tool_ctx->settings.romfs_path.path.valid == VALIDITY_VALID) {
         secpath = &ctx->tool_ctx->settings.romfs_path.path;
     }
 

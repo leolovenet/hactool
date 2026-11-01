@@ -120,6 +120,24 @@ encrypted 16-byte title-key block, not a pre-decrypted content key. An optional
 hactool ignores the suffix when selecting titlekek; it still uses the NCA's
 master-key revision.
 
+## Patch RomFS / BKTR
+
+This tree preserves the original BKTR path and also reads the layered Indirect /
+AesCtrEx BucketTree layout used by newer Patch RomFS containers. Detection is
+automatic: pass the Base Program NCA with `--basenca` and the Update Program NCA as
+the input file.
+
+```sh
+hactool -x -t nca \
+  --basenca=base-program.nca \
+  --romfsdir=output/romfs \
+  update-program.nca
+```
+
+Use `--romfs=merged.romfs` instead of `--romfsdir` when a standalone merged RomFS
+image is wanted. Ordinary NCA/RomFS handling and legacy Patch RomFS continue through
+their original code paths.
+
 ## Licensing
 
 This software is licensed under the terms of the ISC License.  

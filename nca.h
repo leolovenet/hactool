@@ -43,6 +43,7 @@ typedef struct {
     uint64_t virtual_seek;
     uint64_t bktr_seek;
     uint64_t base_seek;
+    int modern_layout;
 } bktr_section_ctx_t;
 
 typedef enum {
@@ -70,7 +71,8 @@ typedef struct {
     uint8_t partition_type;
     uint8_t fs_type;
     uint8_t crypt_type;
-    uint8_t _0x5[0x3];
+    uint8_t metadata_hash_type;
+    uint8_t _0x6[0x2];
     union { /* FS-specific superblock. Size = 0x138. */
         pfs0_superblock_t pfs0_superblock;
         romfs_superblock_t romfs_superblock;

@@ -6,6 +6,25 @@ hactool is a tool to view information about, decrypt, and extract common file fo
 
 It is heavily inspired by [ctrtool](https://github.com/profi200/Project_CTR/tree/master/ctrtool).
 
+## Changes in 1.5.0
+
+This fork release is based on upstream `master` commit `1d64a83` (which includes
+the unreleased upstream changes after `1.4.0`) plus the following fixes and
+features:
+
+- Added automatic support for modern layered Indirect/AesCtrEx BucketTree Patch
+  RomFS containers while preserving the legacy BKTR path.
+- Fixed AMD64 big-number memory clobbers in the bundled mbedTLS, preventing valid
+  NCA, NPDM and ACID signatures from being reported as invalid.
+- Accepted an optional `<keygen>` suffix in `title.keys` so hactool and sys-agent
+  can share one key file.
+- Increased the key-file line limit to 64 KiB, fixing long ticket key imports.
+- Kept section extraction reads bounded at the configured buffer size and added
+  explicit range validation.
+
+The macOS amd64 release asset is built for Intel x86_64 and targets macOS 10.13
+or newer. It is not Developer ID signed or notarized.
+
 ## Usage
 
 ```
